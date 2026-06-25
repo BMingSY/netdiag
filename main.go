@@ -96,7 +96,7 @@ type chartPoint struct {
 	Round int     `json:"round"`
 	Time  string  `json:"time"`
 	OK    bool    `json:"ok"`
-	RTT   float64 `json:"rtt,omitempty"`
+	RTT   float64 `json:"rtt"`
 }
 
 var timeRE = regexp.MustCompile(`time[=<]([0-9.]+)\s*ms`)
@@ -780,7 +780,7 @@ code { background: #eef1f5; border-radius: 4px; padding: 1px 4px; }
     series.forEach(function (s) {
       s.points.forEach(function (p) {
         if (p.round > maxRound) maxRound = p.round;
-        if (p.ok) rtts.push(p.rtt);
+        if (p.ok && Number.isFinite(p.rtt)) rtts.push(p.rtt);
       });
     });
     var maxRTT = includeSpikes.checked ? Math.max.apply(null, rtts.concat([1])) : percentile(rtts, 0.95) * 1.2;
@@ -816,6 +816,10 @@ code { background: #eef1f5; border-radius: 4px; padding: 1px 4px; }
             var lx = x(p.round);
             svg.appendChild(el("line", { x1: lx, y1: margin.top + plotH - 18, x2: lx, y2: margin.top + plotH, class: "chart-loss" }));
           }
+          return;
+        }
+        if (!Number.isFinite(p.rtt)) {
+          open = false;
           return;
         }
         var px = x(p.round);
