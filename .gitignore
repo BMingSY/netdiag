@@ -1,0 +1,4 @@
+netdiag
+result/
+*.csv
+*.html
