@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -81,6 +82,21 @@ type reportData struct {
 	Interval    time.Duration
 	Timeout     time.Duration
 	MaxP95      float64
+	ChartJSON   template.JS
+}
+
+type chartSeries struct {
+	Name   string       `json:"name"`
+	Role   string       `json:"role"`
+	Host   string       `json:"host"`
+	Points []chartPoint `json:"points"`
+}
+
+type chartPoint struct {
+	Round int     `json:"round"`
+	Time  string  `json:"time"`
+	OK    bool    `json:"ok"`
+	RTT   float64 `json:"rtt,omitempty"`
 }
 
 var timeRE = regexp.MustCompile(`time[=<]([0-9.]+)\s*ms`)
@@ -465,6 +481,11 @@ func writeHTMLReport(path string, data reportData) error {
 	if data.MaxP95 < 1 {
 		data.MaxP95 = 1
 	}
+	chartJSON, err := marshalChartJSON(data.Samples)
+	if err != nil {
+		return err
+	}
+	data.ChartJSON = chartJSON
 
 	funcs := template.FuncMap{
 		"ms": func(v float64) string {
@@ -528,6 +549,38 @@ func writeHTMLReport(path string, data reportData) error {
 	return t.Execute(f, data)
 }
 
+func marshalChartJSON(samples []sample) (template.JS, error) {
+	byKey := make(map[string]int)
+	var series []chartSeries
+	for _, s := range samples {
+		key := s.Role + "\x00" + s.Name + "\x00" + s.Host
+		idx, ok := byKey[key]
+		if !ok {
+			idx = len(series)
+			byKey[key] = idx
+			series = append(series, chartSeries{
+				Name: s.Name,
+				Role: s.Role,
+				Host: s.Host,
+			})
+		}
+		pt := chartPoint{
+			Round: s.Round,
+			Time:  s.Time.Format("15:04:05"),
+			OK:    s.OK,
+		}
+		if s.OK {
+			pt.RTT = s.RTTMillis
+		}
+		series[idx].Points = append(series[idx].Points, pt)
+	}
+	data, err := json.Marshal(series)
+	if err != nil {
+		return "", err
+	}
+	return template.JS(data), nil
+}
+
 func healthClass(s stats) string {
 	if s.LossPct >= 5 || s.P95 >= 100 {
 		return "bad"
@@ -569,6 +622,23 @@ tr:last-child td { border-bottom: 0; }
 .barcell { min-width: 160px; }
 .bartrack { height: 8px; width: 100%; border-radius: 999px; background: #e5e7eb; overflow: hidden; }
 .barfill { height: 100%; border-radius: 999px; background: var(--blue); }
+.chart-panel { padding: 0; overflow: hidden; }
+.chart-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.chart-title { font-weight: 650; }
+.chart-tools { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+.chart-tools label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.chart-wrap { height: 380px; padding: 12px 16px 16px; }
+#timelineChart { display: block; width: 100%; height: 100%; }
+.chart-axis { stroke: #d0d5dd; stroke-width: 1; }
+.chart-gridline { stroke: #edf0f4; stroke-width: 1; }
+.chart-label { fill: var(--muted); font-size: 11px; }
+.chart-line { fill: none; stroke-width: 2; }
+.chart-loss { stroke: var(--bad); stroke-width: 2; opacity: .8; }
+.chart-spike { fill: var(--bad); opacity: .8; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 14px; padding: 0 16px 14px; color: #344054; font-size: 12px; }
+.legend-item { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.legend-swatch { width: 16px; height: 3px; border-radius: 999px; flex: 0 0 auto; }
+.legend-text { overflow-wrap: anywhere; }
 .samples { max-height: 560px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
 .samples table { border: 0; border-radius: 0; }
 .samples th { position: sticky; top: 0; z-index: 1; }
@@ -578,6 +648,8 @@ code { background: #eef1f5; border-radius: 4px; padding: 1px 4px; }
   table { font-size: 12px; }
   th, td { padding: 7px 8px; }
   .tablewrap { overflow-x: auto; }
+  .chart-head { align-items: flex-start; flex-direction: column; }
+  .chart-wrap { height: 320px; padding: 8px 10px 12px; }
 }
 </style>
 </head>
@@ -628,6 +700,22 @@ code { background: #eef1f5; border-radius: 4px; padding: 1px 4px; }
     </table>
   </div>
 
+  <h2>Latency Timeline</h2>
+  <section class="panel chart-panel">
+    <div class="chart-head">
+      <div>
+        <div class="chart-title">RTT by round</div>
+        <div class="muted">Red ticks mark packet loss. Red dots at the top mark RTT values clipped above the chart scale.</div>
+      </div>
+      <div class="chart-tools">
+        <label><input id="showLoss" type="checkbox" checked> loss</label>
+        <label><input id="includeSpikes" type="checkbox"> include spikes</label>
+      </div>
+    </div>
+    <div class="chart-wrap"><svg id="timelineChart" role="img" aria-label="Latency timeline chart"></svg></div>
+    <div id="chartLegend" class="legend"></div>
+  </section>
+
   <h2>Samples</h2>
   <div class="samples">
     <table>
@@ -642,6 +730,124 @@ code { background: #eef1f5; border-radius: 4px; padding: 1px 4px; }
     </table>
   </div>
 </main>
+<script>
+(function () {
+  var series = {{.ChartJSON}};
+  var colors = ["#2563eb", "#16a34a", "#f97316", "#7c3aed", "#0891b2", "#db2777", "#475569"];
+  var svg = document.getElementById("timelineChart");
+  var legend = document.getElementById("chartLegend");
+  var showLoss = document.getElementById("showLoss");
+  var includeSpikes = document.getElementById("includeSpikes");
+
+  function percentile(values, p) {
+    if (!values.length) return 1;
+    values = values.slice().sort(function (a, b) { return a - b; });
+    if (values.length === 1) return values[0];
+    var pos = p * (values.length - 1);
+    var lo = Math.floor(pos);
+    var hi = Math.ceil(pos);
+    if (lo === hi) return values[lo];
+    return values[lo] * (hi - pos) + values[hi] * (pos - lo);
+  }
+
+  function clear(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function el(name, attrs) {
+    var node = document.createElementNS("http://www.w3.org/2000/svg", name);
+    Object.keys(attrs || {}).forEach(function (key) {
+      node.setAttribute(key, attrs[key]);
+    });
+    return node;
+  }
+
+  function draw() {
+    clear(svg);
+    clear(legend);
+    if (!series.length) return;
+
+    var box = svg.getBoundingClientRect();
+    var width = Math.max(360, Math.floor(box.width));
+    var height = Math.max(260, Math.floor(box.height));
+    var margin = { top: 14, right: 18, bottom: 34, left: 56 };
+    var plotW = width - margin.left - margin.right;
+    var plotH = height - margin.top - margin.bottom;
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+
+    var maxRound = 1;
+    var rtts = [];
+    series.forEach(function (s) {
+      s.points.forEach(function (p) {
+        if (p.round > maxRound) maxRound = p.round;
+        if (p.ok) rtts.push(p.rtt);
+      });
+    });
+    var maxRTT = includeSpikes.checked ? Math.max.apply(null, rtts.concat([1])) : percentile(rtts, 0.95) * 1.2;
+    if (!isFinite(maxRTT) || maxRTT < 10) maxRTT = 10;
+
+    function x(round) {
+      if (maxRound <= 1) return margin.left;
+      return margin.left + (round - 1) / (maxRound - 1) * plotW;
+    }
+    function y(rtt) {
+      return margin.top + plotH - Math.min(rtt, maxRTT) / maxRTT * plotH;
+    }
+
+    for (var i = 0; i <= 4; i++) {
+      var gy = margin.top + plotH * i / 4;
+      var value = maxRTT * (4 - i) / 4;
+      svg.appendChild(el("line", { x1: margin.left, y1: gy, x2: width - margin.right, y2: gy, class: "chart-gridline" }));
+      svg.appendChild(el("text", { x: margin.left - 8, y: gy + 4, "text-anchor": "end", class: "chart-label" })).textContent = value.toFixed(value >= 100 ? 0 : 1) + " ms";
+    }
+    svg.appendChild(el("line", { x1: margin.left, y1: margin.top, x2: margin.left, y2: margin.top + plotH, class: "chart-axis" }));
+    svg.appendChild(el("line", { x1: margin.left, y1: margin.top + plotH, x2: width - margin.right, y2: margin.top + plotH, class: "chart-axis" }));
+    svg.appendChild(el("text", { x: margin.left, y: height - 10, class: "chart-label" })).textContent = "round 1";
+    svg.appendChild(el("text", { x: width - margin.right, y: height - 10, "text-anchor": "end", class: "chart-label" })).textContent = "round " + maxRound;
+
+    series.forEach(function (s, idx) {
+      var color = colors[idx % colors.length];
+      var path = "";
+      var open = false;
+      s.points.forEach(function (p) {
+        if (!p.ok) {
+          open = false;
+          if (showLoss.checked) {
+            var lx = x(p.round);
+            svg.appendChild(el("line", { x1: lx, y1: margin.top + plotH - 18, x2: lx, y2: margin.top + plotH, class: "chart-loss" }));
+          }
+          return;
+        }
+        var px = x(p.round);
+        var py = y(p.rtt);
+        path += (open ? " L " : " M ") + px.toFixed(1) + " " + py.toFixed(1);
+        open = true;
+        if (p.rtt > maxRTT && !includeSpikes.checked) {
+          svg.appendChild(el("circle", { cx: px, cy: margin.top + 4, r: 3, class: "chart-spike" }));
+        }
+      });
+      svg.appendChild(el("path", { d: path, stroke: color, class: "chart-line" }));
+
+      var item = document.createElement("span");
+      item.className = "legend-item";
+      var swatch = document.createElement("span");
+      swatch.className = "legend-swatch";
+      swatch.style.background = color;
+      var text = document.createElement("span");
+      text.className = "legend-text";
+      text.textContent = s.name + " (" + s.host + ")";
+      item.appendChild(swatch);
+      item.appendChild(text);
+      legend.appendChild(item);
+    });
+  }
+
+  showLoss.addEventListener("change", draw);
+  includeSpikes.addEventListener("change", draw);
+  window.addEventListener("resize", draw);
+  draw();
+})();
+</script>
 </body>
 </html>`
 
